@@ -6,6 +6,7 @@ prior covariance matrix, phi, is found here.
 """
 
 
+import math
 import jax.numpy as jnp
 from . import utilities as utils
 
@@ -40,8 +41,8 @@ def power_law(spectral_parameters, freqs):
     df = jnp.diff(jnp.concatenate((jnp.array([0]), freqs)))
 
     # power law spectrum
-    log10_phi_diags = 2 * utils.log10_renorm + 2 * log10_A - jnp.log10(12.0 * jnp.pi**2) \
-        + (gamma - 3)*jnp.log10(utils.fyr) + (-gamma)*jnp.log10(jnp.repeat(freqs, 2)) \
+    log10_phi_diags = 2 * utils.log10_renorm + 2 * log10_A - math.log10(12.0 * math.pi**2) \
+        + (gamma - 3)*math.log10(utils.fyr) + (-gamma)*jnp.log10(jnp.repeat(freqs, 2)) \
             + jnp.log10(jnp.repeat(df, 2))
     phi_diags = 10**log10_phi_diags
     return phi_diags
@@ -121,7 +122,7 @@ def free_spectral(spectral_parameters, freqs):
     # frequency bins, then append zeros
     # (this might be necessary when a GWB is modeled with fewer
     # frequency bins than the pulsar noise)
-    zeros = jnp.zeros(2 * freqs.shape[0] - log10_rho_repeated.shape[0])
+    zeros = jnp.zeros(2 * freqs.shape[0] - log10_rho_repeated.shape[0], dtype=log10_rho_repeated.dtype)
     log10_rho_extended = jnp.concatenate((log10_rho_repeated, zeros))
 
     # convert to units of [ns]^2

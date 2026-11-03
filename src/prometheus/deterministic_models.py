@@ -56,8 +56,7 @@ class DeterministicModel:
         self.name = name
         self.data = data
         self.get_delays_func = get_delays_func
-        self.parameter_bounds = parameter_bounds
-        self.parameter_bounds = jnp.array(parameter_bounds)
+        self.parameter_bounds = jnp.array(parameter_bounds, dtype=jnp.float32)
         self.param_mins = self.parameter_bounds[:, 0]
         self.param_maxs = self.parameter_bounds[:, 1]
         self.nparams = self.param_mins.shape[0]
@@ -69,8 +68,9 @@ class DeterministicModel:
                                                               self.with_psr_params))
 
         # if no get_coeffs_func specified, use FFT method
-        self.get_coeffs_func = get_coeffs_func or self.get_coeffs_via_FFT
-        self.get_coeffs_func = jax.jit(self.get_coeffs_func)
+        # (in float32, whatever the precision of the user's function)
+        get_coeffs_func = get_coeffs_func or self.get_coeffs_via_FFT
+        self.get_coeffs_func = jax.jit(lambda *args: get_coeffs_func(*args).astype(jnp.float32))
 
         # frequency bins used in deterministic model
         self.nfreqs = self.data.num_coeff_det // 2

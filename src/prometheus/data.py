@@ -14,7 +14,9 @@ from scipy.signal.windows import tukey
 import pandas as pd
 from pyarrow import feather
 import pickle
+import json
 from tqdm import tqdm
+import jax
 import jax.numpy as jnp
 from typing import Optional
 
@@ -53,6 +55,26 @@ class Data:
     marg_tm : bool
         Whether or not to analytically marginalize over linear deviations
         to the timing model. Defaults to True.
+    nfreqs_dm : int
+        Shorthand for a dispersion measure (DM) basis: adds
+        FourierBasis('dm', nfreqs_dm, chromatic_index=2, fref=dm_fref) to
+        'extra_bases'. Defaults to 0 (no DM basis).
+    dm_fref : float
+        Reference radio frequency [MHz] of the DM basis. DM Fourier coefficients
+        are timing delays at this radio frequency. Defaults to 1400 MHz.
+    extra_bases : list of FourierBasis
+        Fourier bases in addition to the achromatic pulsar noise basis 'red'
+        (nfreqs bins), e.g. chromatic bases for DM variations or scattering, or a
+        separate basis for a common process. Spectral models refer to a basis by
+        its name. The noise-weighted inner products between every pair of bases
+        (and the deterministic basis) are computed once here. Defaults to None.
+
+    Bases
+    -----
+    The stochastic bases are named. 'red' is the achromatic Fourier basis with
+    'nfreqs' bins on the PTA span, which the pulsar noise and (by default) the
+    common process share. Each FourierBasis in 'extra_bases' adds another. The
+    deterministic basis 'det' is built separately (see 'nfreqs_det').
     """
 
     def __init__(self,
@@ -65,8 +87,11 @@ class Data:
                  nfreqs_det : int = 60,
                  ecorr : bool = True,
                  marg_tm : bool = True,
-                 per_psr_data_dict_filepath : Optional[str] = None):
-        
+                 per_psr_data_dict_filepath : Optional[str] = None,
+                 nfreqs_dm : int = 0,
+                 dm_fref : float = 1400.0,
+                 extra_bases : Optional[list['FourierBasis']] = None):
+
         self.name = name
         self.psrs = psrs
         self.wn_rn_dict = wn_dict
@@ -76,6 +101,18 @@ class Data:
         self.nfreqs_det = nfreqs_det
         self.ecorr = ecorr
         self.marg_tm = marg_tm
+        self.dm_fref = dm_fref
+
+        # stochastic bases besides 'red', in the order they are stacked
+        extra_bases = list(extra_bases or [])
+        if nfreqs_dm > 0:
+            if any(b.name == 'dm' for b in extra_bases):
+                raise ValueError("Give the DM basis either as nfreqs_dm or in extra_bases, not both.")
+            extra_bases.append(FourierBasis('dm', nfreqs_dm, chromatic_index=2., fref=dm_fref))
+        names = [b.name for b in extra_bases]
+        if len(set(names)) != len(names) or set(names) & {'red', 'det'}:
+            raise ValueError(f"Basis names must be unique and not 'red' or 'det', got {names}.")
+        self.extra_bases = extra_bases
 
         # remove red noise parameters (if any) from "white noise" dictionary
         self.wn_dict = dict()
@@ -173,7 +210,103 @@ class Data:
                                 for name in self.psr_names]) / (utils.renorm**2.)
         self.TDNrs = jnp.array([self.per_psr_data_dict[name]['TDNr']
                                 for name in self.psr_names]) / utils.renorm
-    
+
+        # the bases actually stored in the per-pulsar dictionary (which may come from a file)
+        self.extra_bases = _extra_bases_from_dict(self.per_psr_data_dict[self.psr_names[0]])
+
+        # dispersion measure (DM) basis arrays, kept as attributes for convenience
+        self.has_dm = 'dm' in self.basis_names
+        if self.has_dm:
+            self.dm_fref = self.get_basis('dm').fref
+            self.nfreqs_dm = self.get_basis('dm').nfreqs
+            self.ncomponents_dm = 2 * self.nfreqs_dm
+            self.freqs_dm = self.basis_freqs('dm')
+            # F_dm^T N^-1 F_dm, shape (Npsrs, 2*Nf_dm, 2*Nf_dm)
+            self.FdmNFdms = jnp.array([self.per_psr_data_dict[name]['FdmNFdm']
+                                       for name in self.psr_names]) / utils.renorm**2
+            # F^T N^-1 F_dm, shape (Npsrs, 2*Nf, 2*Nf_dm)
+            self.FNFdms = jnp.array([self.per_psr_data_dict[name]['TNFdm']
+                                     for name in self.psr_names]) / utils.renorm**2
+            # F_dm^T N^-1 r, shape (Npsrs, 2*Nf_dm)
+            self.FdmNrs = jnp.array([self.per_psr_data_dict[name]['FdmNr']
+                                     for name in self.psr_names]) / utils.renorm
+            # F_dm^T N^-1 F_D, shape (Npsrs, 2*Nf_dm, Nd)
+            self.FdmNTDs = jnp.array([self.per_psr_data_dict[name]['FdmNTD']
+                                      for name in self.psr_names]) / utils.renorm**2
+        else:
+            self.nfreqs_dm = 0
+            self.ncomponents_dm = 0
+
+        # the constants above are computed in float64, but stored in float32,
+        # the precision of the posterior evaluation (see __init__.py)
+        for key, value in list(vars(self).items()):
+            if isinstance(value, jax.Array) and jnp.issubdtype(value.dtype, jnp.inexact):
+                setattr(self, key, value.astype(jnp.complex64 if jnp.iscomplexobj(value) else jnp.float32))
+
+
+    # The stochastic bases are named: 'red' (nfreqs bins, built by enterprise) plus
+    # 'extra_bases'. The methods below also work on Data objects pickled before
+    # 'extra_bases' existed, whose only extra basis can be the DM basis.
+
+    @property
+    def basis_names(self):
+        """Names of the stochastic bases, in the order they are stacked."""
+        return ['red'] + [b.name for b in self._extra_bases()]
+
+    def _extra_bases(self):
+        if 'extra_bases' in self.__dict__:
+            return self.__dict__['extra_bases']
+        return _extra_bases_from_dict(self.per_psr_data_dict[self.psr_names[0]])
+
+    def get_basis(self, name):
+        """The FourierBasis named 'name' ('red' or one of 'extra_bases')."""
+        if name == 'red':
+            return FourierBasis('red', self.nfreqs)
+        for basis in self._extra_bases():
+            if basis.name == name:
+                return basis
+        raise ValueError(f"Data object has no basis '{name}'; its bases are {self.basis_names}.")
+
+    def basis_Tspan(self, name):
+        """Span [s] whose harmonics the basis 'name' uses."""
+        Tspan = self.get_basis(name).Tspan
+        return float(self.Tspan) if Tspan is None else Tspan
+
+    def basis_freqs(self, name):
+        """Frequencies [Hz] k / Tspan, k = 1...nfreqs, of the basis 'name'."""
+        return jnp.arange(1, self.get_basis(name).nfreqs + 1, dtype=jnp.float32) / self.basis_Tspan(name)
+
+    def basis_ncomponents(self, name):
+        """Number of columns of the basis 'name' ('det' for the deterministic basis)."""
+        return self.num_coeff_det if name == 'det' else 2 * self.get_basis(name).nfreqs
+
+    def gram(self, psr_name, a, b):
+        """
+        Noise-weighted inner product F_a^T N^-1 F_b of bases 'a' and 'b'
+        ('det' for the deterministic basis) for one pulsar, in float64 and the
+        [ns]-based units of the stored float32 arrays (e.g. FNFs), i.e. matching
+        prior covariances in [ns]^2. Falls back to the float32 arrays when no
+        float64 copy exists.
+        """
+        order = self.basis_names + ['det']
+        transpose = order.index(a) > order.index(b)
+        if transpose:
+            a, b = b, a
+        G = self._inner_product(psr_name, _gram_key(a, b), nbasis=2)
+        return G.T if transpose else G
+
+    def basis_Nr(self, psr_name, a):
+        """Noise-weighted residual inner product F_a^T N^-1 r of basis 'a' for one pulsar (units as in gram)."""
+        return self._inner_product(psr_name, _nr_key(a), nbasis=1)
+
+    def _inner_product(self, psr_name, key, nbasis):
+        entry = self.per_psr_data_dict[psr_name]
+        if key in entry:
+            return np.asarray(entry[key], dtype=np.float64) / utils.renorm**nbasis
+        if key in _LEGACY_ARRAYS:
+            return np.asarray(getattr(self, _LEGACY_ARRAYS[key])[self.psr_names.index(psr_name)], dtype=np.float64)
+        raise KeyError(f"No inner product '{key}' stored for {psr_name}.")
+
 
     def build_single_psr_enterprise_model(self, psr, Tspan, log10_Arn=-12, gamma=4.33):
         """
@@ -312,7 +445,22 @@ class Data:
                 TDNTD = ndiag.solve(F_D, left_array=F_D)
                 TNTD = ndiag.solve(F_D, left_array=T)
                 TDNr = ndiag.solve(res, left_array=F_D)
-                
+
+                # extra bases: inner products with themselves, each other, the
+                # 'red' basis T, the deterministic basis F_D, and the residuals
+                extra_entries = dict(basis_specs_json=json.dumps([b.to_dict() for b in self.extra_bases]))
+                stacked = [('red', T)]
+                for basis in self.extra_bases:
+                    F_b = basis.design_matrix(psr.toas, psr.freqs, Tspan)
+                    for name_a, F_a in stacked:
+                        extra_entries[_gram_key(name_a, basis.name)] = ndiag.solve(F_b, left_array=F_a)
+                    extra_entries[_gram_key(basis.name, basis.name)] = ndiag.solve(F_b, left_array=F_b)
+                    extra_entries[_gram_key(basis.name, 'det')] = ndiag.solve(F_D, left_array=F_b)
+                    extra_entries[_nr_key(basis.name)] = ndiag.solve(res, left_array=F_b)
+                    stacked.append((basis.name, F_b))
+                    if basis.name == 'dm':
+                        extra_entries.update(nfrequencies_dm=basis.nfreqs, dm_fref=basis.fref)
+
                 # use parallax and DM methods for pulsar distance
                 if self.psr_dists_dict is not None and psr.name in list(self.psr_dists_dict.keys()):
                     pdist = self.psr_dists_dict[psr.name]
@@ -357,6 +505,7 @@ class Data:
                     sparse_toas_det = sparse_toas_det,
                     freqs_forFFT = freqs_forFFT,
                     Tspan_ext = Tspan_ext,
+                    **extra_entries,
                 )
 
         return data_dict
@@ -384,6 +533,101 @@ class Data:
         print(f'Saved data object to {filepath}.')
 
 
+
+
+class FourierBasis:
+    """
+    A (possibly chromatic) Fourier basis for per-pulsar or common Gaussian processes.
+
+    Column 2k (2k + 1) is sin (cos) of 2 pi f_k t with f_k = (k + 1) / Tspan, scaled
+    per TOA by (fref / nu)^chromatic_index, where nu is the radio frequency of the TOA.
+    Coefficients are therefore timing delays at the reference radio frequency, as in
+    enterprise.signals.utils.createfourierdesignmatrix_dm and _chromatic.
+
+    Parameters
+    ----------
+    name : str
+        Name by which spectral models refer to the basis.
+    nfreqs : int
+        Number of frequency bins.
+    chromatic_index : float
+        0 for achromatic processes, 2 for dispersion measure (DM) variations,
+        4 for scattering. Defaults to 0.
+    fref : float
+        Reference radio frequency [MHz]. Defaults to 1400 MHz.
+    Tspan : float or None
+        Span [s] whose harmonics the basis uses. Defaults to None, the PTA span.
+    """
+
+    def __init__(self, name : str, nfreqs : int, chromatic_index : float = 0.,
+                 fref : float = 1400., Tspan : Optional[float] = None):
+        self.name = name
+        self.nfreqs = int(nfreqs)
+        self.chromatic_index = float(chromatic_index)
+        self.fref = float(fref)
+        self.Tspan = None if Tspan is None else float(Tspan)
+
+    def __repr__(self):
+        return (f"FourierBasis('{self.name}', nfreqs={self.nfreqs}, chromatic_index={self.chromatic_index:g}, "
+                f"fref={self.fref:g}, Tspan={self.Tspan})")
+
+    def to_dict(self):
+        return dict(name=self.name, nfreqs=self.nfreqs, chromatic_index=self.chromatic_index,
+                    fref=self.fref, Tspan=self.Tspan)
+
+    def design_matrix(self, toas, radio_freqs, Tspan):
+        """
+        Design matrix of shape (Ntoas, 2 * nfreqs) for one pulsar.
+
+        Parameters
+        ----------
+        toas : array
+            TOAs [s] of the pulsar.
+        radio_freqs : array
+            Radio frequencies [MHz] of the TOAs.
+        Tspan : float
+            Observation span [s] of the PTA, used unless the basis sets its own.
+        """
+        toas = np.asarray(toas, dtype=np.float64)
+        T = Tspan if self.Tspan is None else self.Tspan
+        f = np.arange(1, self.nfreqs + 1) / T
+        phase = 2. * np.pi * toas[:, None] * f[None, :]
+        F = np.zeros((toas.shape[0], 2 * self.nfreqs))
+        F[:, ::2] = np.sin(phase)
+        F[:, 1::2] = np.cos(phase)
+        if self.chromatic_index != 0.:
+            F *= ((self.fref / np.asarray(radio_freqs, dtype=np.float64)) ** self.chromatic_index)[:, None]
+        return F
+
+
+# names of the noise-weighted inner products stored per pulsar: those of the
+# 'red', 'dm' and 'det' bases keep the names used throughout Prometheus
+_GRAM_KEYS = {('red', 'red'): 'TNT', ('red', 'det'): 'TNTD', ('det', 'det'): 'TDNTD',
+              ('red', 'dm'): 'TNFdm', ('dm', 'dm'): 'FdmNFdm', ('dm', 'det'): 'FdmNTD'}
+_NR_KEYS = {'red': 'TNr', 'det': 'TDNr', 'dm': 'FdmNr'}
+# float32 Data attributes holding the same inner products
+_LEGACY_ARRAYS = {'TNT': 'FNFs', 'TNr': 'FNrs', 'TNTD': 'TNTDs', 'TDNTD': 'TDNTDs', 'TDNr': 'TDNrs',
+                  'TNFdm': 'FNFdms', 'FdmNFdm': 'FdmNFdms', 'FdmNTD': 'FdmNTDs', 'FdmNr': 'FdmNrs'}
+
+
+def _gram_key(a, b):
+    """Per-pulsar dictionary key of F_a^T N^-1 F_b (a before b in the stacking order)."""
+    return _GRAM_KEYS.get((a, b), f'{a}N{b}')
+
+
+def _nr_key(a):
+    """Per-pulsar dictionary key of F_a^T N^-1 r."""
+    return _NR_KEYS.get(a, f'{a}Nr')
+
+
+def _extra_bases_from_dict(psr_entry):
+    """The extra bases stored in one pulsar's entry of the per-pulsar dictionary."""
+    if 'basis_specs_json' in psr_entry:
+        return [FourierBasis(**spec) for spec in json.loads(psr_entry['basis_specs_json'])]
+    if 'FdmNFdm' in psr_entry:   # DM basis built before extra bases were stored by name
+        return [FourierBasis('dm', int(psr_entry['nfrequencies_dm']), chromatic_index=2.,
+                             fref=float(psr_entry.get('dm_fref', 1400.)))]
+    return []
 
 
 @function

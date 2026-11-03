@@ -1,5 +1,6 @@
 '''Store constants and utility functions.'''
 
+import math
 import numpy as np
 import jax.numpy as jnp
 from pyarrow import feather
@@ -10,7 +11,7 @@ import pandas as pd
 
 # Re-scale to use base unit of [ns] to avoid numerical over/under flow in float32
 renorm = 1e9
-log10_renorm = jnp.log10(renorm)
+log10_renorm = math.log10(renorm)
 
 # rescales TOA axis for deterministic CW signals
 cw_renorm = 1e-10
@@ -37,7 +38,7 @@ Mpc = 1.e3 * kpc
 Tkpc = kpc / c
 
 # log_e(10)
-ln10 = jnp.log(10.)
+ln10 = math.log(10.)
 
 
 # Utility functions-------------------------------------------------------------

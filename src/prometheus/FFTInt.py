@@ -135,7 +135,7 @@ def _fourier_design(n_t, T, Nf, dtype=np.float64):
 
 
 def build_phi_from_chat(spectra_func, dataset, oversample=8, jitter_scale=10.0,
-                        dtype=jnp.float32):
+                        dtype=jnp.float32, nfreqs=None, Tspan=None):
     """
     Build the (2Nf, 2Nf) frequency-domain covariance matrix phi from the
     time-domain C-hat matrix.
@@ -155,6 +155,11 @@ def build_phi_from_chat(spectra_func, dataset, oversample=8, jitter_scale=10.0,
         Set to 0 to disable.
     dtype : jax dtype
         Floating-point precision.  Default ``jnp.float32``.
+    nfreqs : int or None
+        Number of canonical Fourier frequency bins (f_k = k/T). Defaults to
+        ``dataset.nfreqs``; set to that of the basis the process lives on.
+    Tspan : float or None
+        Span T [s] of the basis. Defaults to ``dataset.Tspan``.
 
     Returns
     -------
@@ -170,8 +175,8 @@ def build_phi_from_chat(spectra_func, dataset, oversample=8, jitter_scale=10.0,
             "spectra.free_spectral has no continuum interpolation."
         )
 
-    Nf = dataset.nfreqs
-    T = float(dataset.Tspan)
+    Nf = dataset.nfreqs if nfreqs is None else nfreqs
+    T = float(dataset.Tspan if Tspan is None else Tspan)
     n_t = 2 * Nf + 1
 
     n_os = Nf * oversample

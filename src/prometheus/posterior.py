@@ -29,7 +29,7 @@ def cholesky_inverse_det_phi(phi_cube):
     """
     phi_chol_factors = vmap(lambda x: jsl.cho_factor(x, lower=True))(phi_cube)
     phiinvs = vmap(lambda cf: jsl.cho_solve((cf[0], True),
-                                            jnp.identity(cf[0].shape[0])))(phi_chol_factors)
+                                            jnp.identity(cf[0].shape[0], dtype=cf[0].dtype)))(phi_chol_factors)
     phi_ln_dets = 2 * jnp.sum(jnp.log(jnp.diagonal(phi_chol_factors[0],
                                                    axis1=1, axis2=2) / utils.renorm), axis=1)
     return phi_chol_factors, phiinvs, phi_ln_dets
@@ -109,7 +109,7 @@ def standardizing_transform(z, phiinvs, FNFs, FNrs, T=1.0):
     # get CURN Fourier coefficient (posterior) covariance and Cholesky
     phiinv_vecs_curn_fp = jnp.diagonal(phiinvs, axis1=1, axis2=2) # (2 * nfreqs, npsrs)
     Na, Np = phiinv_vecs_curn_fp.shape
-    phiinv_curn_pf = jnp.zeros((Np, Na, Na))
+    phiinv_curn_pf = jnp.zeros((Np, Na, Na), dtype=phiinvs.dtype)
     freq_ndxs = jnp.arange(Na)
     phiinv_curn_pf = phiinv_curn_pf.at[:, freq_ndxs, freq_ndxs].set(phiinv_vecs_curn_fp.T)
     Sigma_inv = FNFs / T + phiinv_curn_pf
