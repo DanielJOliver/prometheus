@@ -18,7 +18,7 @@ The posterior is implemented in [JAX](https://jax.readthedocs.io/en/latest/) whi
 
 Install directly with pip:
 ```bash
-    pip install git+https://github.com/XGI-MSU/prometheus.git
+pip install git+https://github.com/XGI-MSU/prometheus.git
 ```
 
 ## Requirements & Conventions
