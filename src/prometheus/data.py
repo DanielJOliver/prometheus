@@ -73,7 +73,8 @@ class Data:
     -----
     The stochastic bases are named. 'red' is the achromatic Fourier basis with
     'nfreqs' bins on the PTA span, which the pulsar noise and (by default) the
-    common process share. Each FourierBasis in 'extra_bases' adds another. The
+    common process share. Each FourierBasis in 'extra_bases' adds another, on the
+    PTA span, a span of its own, or each pulsar's own span (Tspan='psr'). The
     deterministic basis 'det' is built separately (see 'nfreqs_det').
     """
 
@@ -268,13 +269,24 @@ class Data:
         raise ValueError(f"Data object has no basis '{name}'; its bases are {self.basis_names}.")
 
     def basis_Tspan(self, name):
-        """Span [s] whose harmonics the basis 'name' uses."""
-        Tspan = self.get_basis(name).Tspan
-        return float(self.Tspan) if Tspan is None else Tspan
+        """
+        Span [s] whose harmonics the basis 'name' uses: a float, or for a basis with
+        Tspan='psr' an array of shape (Npsrs,) holding each pulsar's span.
+        """
+        basis = self.get_basis(name)
+        if basis.per_psr:
+            return np.array([self.per_psr_data_dict[p]['Tspan_psr'] for p in self.psr_names])
+        return float(self.Tspan) if basis.Tspan is None else basis.Tspan
 
     def basis_freqs(self, name):
-        """Frequencies [Hz] k / Tspan, k = 1...nfreqs, of the basis 'name'."""
-        return jnp.arange(1, self.get_basis(name).nfreqs + 1, dtype=jnp.float32) / self.basis_Tspan(name)
+        """
+        Frequencies [Hz] k / Tspan, k = 1...nfreqs, of the basis 'name': shape
+        (nfreqs,), or (Npsrs, nfreqs) for a basis with Tspan='psr'.
+        """
+        k = np.arange(1, self.get_basis(name).nfreqs + 1)
+        Tspan = self.basis_Tspan(name)
+        freqs = k / Tspan[:, None] if np.ndim(Tspan) else k / Tspan
+        return jnp.asarray(freqs, dtype=jnp.float32)
 
     def basis_ncomponents(self, name):
         """Number of columns of the basis 'name' ('det' for the deterministic basis)."""
@@ -479,6 +491,7 @@ class Data:
                     phi = psr.phi,
                     theta = psr.theta,
                     Tspan = Tspan,
+                    Tspan_psr = psr.toas.max() - psr.toas.min(),
                     log10_Arn = log10_Arn,
                     gamma = gamma,
                     nfrequencies = nfrequencies,
@@ -555,21 +568,34 @@ class FourierBasis:
         4 for scattering. Defaults to 0.
     fref : float
         Reference radio frequency [MHz]. Defaults to 1400 MHz.
-    Tspan : float or None
-        Span [s] whose harmonics the basis uses. Defaults to None, the PTA span.
+    Tspan : float, 'psr' or None
+        Span [s] whose harmonics the basis uses. 'psr' gives each pulsar the
+        harmonics of its own observing span (max - min of its TOAs), as enterprise
+        does by default for intrinsic pulsar noise. Pulsars then have different
+        frequencies, so only per-pulsar processes (IndependentSpectralModel) in the
+        'marginalized' sampling model may live on such a basis, without
+        inter-frequency correlations. Defaults to None, the PTA span.
     """
 
     def __init__(self, name : str, nfreqs : int, chromatic_index : float = 0.,
-                 fref : float = 1400., Tspan : Optional[float] = None):
+                 fref : float = 1400., Tspan : Optional[float | str] = None):
         self.name = name
         self.nfreqs = int(nfreqs)
         self.chromatic_index = float(chromatic_index)
         self.fref = float(fref)
-        self.Tspan = None if Tspan is None else float(Tspan)
+        if isinstance(Tspan, str) and Tspan != 'psr':
+            raise ValueError(f"Tspan must be a span [s], 'psr' or None, got {Tspan!r}.")
+        self.Tspan = Tspan if Tspan is None or Tspan == 'psr' else float(Tspan)
+
+    @property
+    def per_psr(self):
+        """Whether each pulsar uses the harmonics of its own observing span."""
+        return self.Tspan == 'psr'
 
     def __repr__(self):
+        Tspan = repr(self.Tspan) if self.per_psr else self.Tspan
         return (f"FourierBasis('{self.name}', nfreqs={self.nfreqs}, chromatic_index={self.chromatic_index:g}, "
-                f"fref={self.fref:g}, Tspan={self.Tspan})")
+                f"fref={self.fref:g}, Tspan={Tspan})")
 
     def to_dict(self):
         return dict(name=self.name, nfreqs=self.nfreqs, chromatic_index=self.chromatic_index,
@@ -586,10 +612,14 @@ class FourierBasis:
         radio_freqs : array
             Radio frequencies [MHz] of the TOAs.
         Tspan : float
-            Observation span [s] of the PTA, used unless the basis sets its own.
+            Observation span [s] of the PTA, used unless the basis sets its own
+            (with Tspan='psr', the span of 'toas').
         """
         toas = np.asarray(toas, dtype=np.float64)
-        T = Tspan if self.Tspan is None else self.Tspan
+        if self.per_psr:
+            T = toas.max() - toas.min()
+        else:
+            T = Tspan if self.Tspan is None else self.Tspan
         f = np.arange(1, self.nfreqs + 1) / T
         phase = 2. * np.pi * toas[:, None] * f[None, :]
         F = np.zeros((toas.shape[0], 2 * self.nfreqs))

@@ -65,8 +65,24 @@ data = data.Data(name='NG15', psrs=psrs, wn_dict=wn_dict, nfreqs=30,
                  extra_bases=[FourierBasis('dm', nfreqs=30, chromatic_index=2)])
 ```
 
-(`nfreqs_dm=30` is a shorthand for the DM basis above.) The noise-weighted inner
-products between every pair of bases, the deterministic basis and the residuals
+(`nfreqs_dm=30` is a shorthand for the DM basis above.) With `Tspan='psr'`, a basis
+uses each pulsar's own observing span, i.e. frequencies `k / T_psr`, instead of the PTA span. Since the frequencies
+then differ between pulsars, such a basis holds only per-pulsar processes in the
+`'marginalized'` sampling model (without inter-frequency correlations); the common
+process stays on a basis shared by all pulsars, e.g. `'red'`:
+
+```python
+data = data.Data(name='NG15', psrs=psrs, wn_dict=wn_dict, nfreqs=14,   # 'red': GWB
+                 extra_bases=[FourierBasis('rn', nfreqs=30, Tspan='psr'),
+                              FourierBasis('dm', nfreqs=30, chromatic_index=2, Tspan='psr')])
+rn_model = IndependentSpectralModel(..., basis='rn')
+dm_model = IndependentSpectralModel(..., basis='dm')
+gwb_model = CommonSpectralModel(..., correlation_matrix='HD')          # basis='red'
+pta_model = PTAModel(psr_model=[rn_model, dm_model], gwb_model=gwb_model)
+```
+
+The noise-weighted inner
+products between every pair of bases, the deterministic basis, and the residuals
 are computed once, when the `Data` object is built; spectral models then refer to a
 basis by name.
 

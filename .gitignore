@@ -235,4 +235,5 @@ tests/PP_plots
 tests/simulations
 src/prometheus/simulate.py
 examples/advanced_modeling/freq_corr.ipynb
+image/
 

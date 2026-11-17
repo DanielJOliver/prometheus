@@ -114,7 +114,8 @@ class PTAModel:
         e.g. [F | F_dm]) are marginalized analytically, and only the common
         coefficients are sampled, under the standardizing transform conditional on
         the marginalized per-pulsar processes. Supports any number of per-pulsar
-        processes on any bases, non-diagonal prior covariances (inter-frequency
+        processes on any bases (including bases on each pulsar's own span,
+        Tspan='psr'), non-diagonal prior covariances (inter-frequency
         correlations), and a common process on its own basis.
 
     By default the 'shared' model is used whenever it applies and a common process
@@ -449,6 +450,16 @@ class PTAModel:
         if getattr(self, '_whitened_cache', None) is not None:
             return self._whitened_cache
 
+        # The first call may come from inside a jit/pmap trace (e.g. NUTS with parallel
+        # chains initializes the model under pmap). Build the cache eagerly regardless,
+        # so it holds concrete arrays rather than tracers that would leak into later traces.
+        with jax.ensure_compile_time_eval():
+            self._whitened_cache = self._build_whitened_basis(rtol)
+        return self._whitened_cache
+
+
+    def _build_whitened_basis(self, rtol):
+        """Compute the (Xs, ys) cached by _whitened_basis."""
         bases = list(self.stacked_bases())
         Xs, ys = [], []
         for name in self.psr_names:
@@ -469,9 +480,8 @@ class PTAModel:
             X_pad[i, :len(y)] = X
             y_pad[i, :len(y)] = y
 
-        self._whitened_cache = (jnp.asarray(X_pad, dtype=jnp.float32),
-                                jnp.asarray(y_pad, dtype=jnp.float32))
-        return self._whitened_cache
+        return (jnp.asarray(X_pad, dtype=jnp.float32),
+                jnp.asarray(y_pad, dtype=jnp.float32))
 
 
     def sampling_model_marginalized(self):
@@ -499,11 +509,13 @@ class PTAModel:
         -0.5 y^T M^{-1} y - 0.5 ln det M.
         """
 
-        # per-pulsar hyper-parameters and prior covariances, grouped by basis
+        # per-pulsar hyper-parameters and prior covariances, grouped by basis; on a
+        # basis with Tspan='psr', each pulsar's spectrum uses its own frequencies
         psr_phis = {}
         for psr_model in self.psr_models:
             psr_params = self._sample_psr_params(psr_model)
-            phi = vmap(psr_model.get_phi_func, in_axes=(0, None))(psr_params, psr_model.freqs)
+            freqs_axis = 0 if psr_model.per_psr_freqs else None
+            phi = vmap(psr_model.get_phi_func, in_axes=(0, freqs_axis))(psr_params, psr_model.freqs)
             psr_phis[psr_model.basis] = psr_phis[psr_model.basis] + phi if psr_model.basis in psr_phis else phi
 
         # GWB hyper-parameters

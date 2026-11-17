@@ -76,11 +76,16 @@ class SpectralModel:
 
         self._get_phi_cube_func = get_phi_cube_func
 
-        # the Fourier basis this model lives on
+        # the Fourier basis this model lives on; on a basis with Tspan='psr' the
+        # frequencies differ between pulsars, and have shape (Npsrs, Nf)
         self.basis = basis
         self.freqs = self.data.basis_freqs(basis)
-        self.nfreqs_basis = len(self.freqs)
+        self.nfreqs_basis = self.freqs.shape[-1]
+        self.per_psr_freqs = self.freqs.ndim == 2
 
+        if self.freq_corrs and self.per_psr_freqs:
+            raise ValueError(f"Inter-frequency correlations (freq_corrs=True) are not supported on basis "
+                             f"'{basis}', whose frequencies differ between pulsars (Tspan='psr').")
         if self.freq_corrs:
             chat_kwargs = dict(oversample=8, nfreqs=self.nfreqs_basis, Tspan=self.data.basis_Tspan(basis))
             if self.get_phi_diag_func is spectra.free_spectral:
@@ -163,7 +168,8 @@ class IndependentSpectralModel(SpectralModel):
         prior covariance. Defaults to False.
     basis : str
         Name of the Fourier basis of the Data object the model lives on.
-        Defaults to 'red'.
+        Defaults to 'red'. On a basis with Tspan='psr', get_phi_diag_func is
+        evaluated on each pulsar's own frequencies k / T_psr.
     """
 
     def __init__(self,
@@ -202,7 +208,8 @@ class IndependentSpectralModel(SpectralModel):
                 the (i, j, k) element is the covariance of the ith Fourier coefficient
                 between pulsars j and k. The covariance should use units of [ns]^2.
             """
-            phi_diags = jax.vmap(get_phi_diag_func, in_axes=(0, None))(params, freqs).T
+            freqs_axis = 0 if jnp.ndim(freqs) == 2 else None    # per-pulsar frequencies (Tspan='psr')
+            phi_diags = jax.vmap(get_phi_diag_func, in_axes=(0, freqs_axis))(params, freqs).T
             nfreqs2, npsrs = phi_diags.shape
             phi_cube = jnp.zeros((nfreqs2, npsrs, npsrs), dtype=phi_diags.dtype)
             ii = jnp.arange(npsrs)
@@ -321,6 +328,9 @@ class CommonSpectralModel(SpectralModel):
                  basis : str = 'red'):
         self.data = data
         self.get_phi_diag_func = get_phi_diag_func
+        if data.get_basis(basis).per_psr:
+            raise ValueError(f"A common process cannot live on basis '{basis}', whose frequencies differ "
+                             f"between pulsars (Tspan='psr'); use a basis on a span common to all pulsars.")
         nfreqs_basis = data.get_basis(basis).nfreqs
         self.nfreqs = nfreqs or nfreqs_basis
         if self.nfreqs > nfreqs_basis:
